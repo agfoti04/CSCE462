@@ -84,8 +84,24 @@ static int angleToPulse(int angle) {
 
 static void servoPulse(int us) {
     // servoCycles = 0 means "run until changed".
-    lgTxServo(g_h, PIN_SERVO, us, SERVO_HZ, 0, 0);
+    int rc = lgTxServo(g_h, PIN_SERVO, us, SERVO_HZ, 0, 0);
+    if (rc < 0) {
+        std::cerr << "lgTxServo failed (error " << rc << ": " << lguErrorText(rc) << ")\n";
+        return;
+    }
     g_servoUs = us;
+}
+
+// Diagnostic: drive GPIO 12 as a plain steady HIGH or LOW so a multimeter can see it.
+static void servoPinSteady(int level) {
+    servoPulse(0);  // stop any servo pulses first
+    int rc = lgGpioWrite(g_h, PIN_SERVO, level);
+    if (rc < 0) {
+        std::cerr << "lgGpioWrite failed (error " << rc << ": " << lguErrorText(rc) << ")\n";
+        return;
+    }
+    std::cout << "GPIO " << PIN_SERVO << " (physical pin 32) held "
+              << (level ? "HIGH (expect ~3.3V)" : "LOW (expect ~0V)") << "\n";
 }
 
 static void servoAngle(int angle) { servoPulse(angleToPulse(angle)); }
@@ -125,6 +141,8 @@ static void printMenu() {
         "   c) Center (90 deg)\n"
         "   s) Set angle (0-180)\n"
         "   o) Servo off (stop pulses)\n"
+        "   h) DIAGNOSTIC: hold GPIO 12 steady HIGH (meter test)\n"
+        "   l) DIAGNOSTIC: hold GPIO 12 steady LOW\n"
         "\n   p) Print current pin states\n"
         "   q) Quit\n"
         "===========================================\n"
@@ -213,6 +231,8 @@ int main() {
                 break;
             }
             case 'o': servoOff(); std::cout << "Servo pulses off\n"; break;
+            case 'h': servoPinSteady(1); break;
+            case 'l': servoPinSteady(0); break;
 
             case 'p': printPins(); break;
             case 'q': g_running = false; break;
