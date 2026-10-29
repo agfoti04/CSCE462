@@ -85,6 +85,9 @@ static int angleToPulse(int angle) {
 static void servoPulse(int us) {
     // servoCycles = 0 means "run until changed".
     int rc = lgTxServo(g_h, PIN_SERVO, us, SERVO_HZ, 0, 0);
+    // Asking lgpio to stop pulses on a pin that has none running returns
+    // LG_BAD_PWM_MICROS (-86). That just means "already off", so it is not an error.
+    if (us == 0 && rc == LG_BAD_PWM_MICROS) rc = 0;
     if (rc < 0) {
         std::cerr << "lgTxServo failed (error " << rc << ": " << lguErrorText(rc) << ")\n";
         return;
