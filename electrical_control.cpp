@@ -1,5 +1,6 @@
 // l298n_servo_test.cpp
 // Interactive hardware test for an L298N motor driver and a servo on a Raspberry Pi.
+// Uses the lgpio library (works on Pi 3/4/5 and current Raspberry Pi OS).
 //
 // Pin map (BCM numbering):
 //   L298N IN1 = GPIO 2   (Motor A)
@@ -8,54 +9,67 @@
 //   L298N IN4 = GPIO 14  (Motor B)
 //   Servo signal = GPIO 12
 //
+// Install:
+//   sudo apt install liblgpio-dev
+//
 // Build:
-//   sudo apt install pigpio libpigpio-dev
-//   g++ -Wall -O2 -o l298n_servo_test l298n_servo_test.cpp -lpigpio -lrt -pthread
+//   g++ -Wall -O2 -o l298n_servo_test l298n_servo_test.cpp -llgpio -lrt -pthread
 //
-// Run (pigpio needs root):
-//   sudo ./l298n_servo_test
-//
-// Note: this uses the pigpio library, which works on Pi 4 and earlier.
-// It does NOT work on the Raspberry Pi 5.
+// Run:
+//   ./l298n_servo_test
+//   (if you get a permission error: sudo ./l298n_servo_test)
 
-#include <pigpio.h>
+#include <lgpio.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <csignal>
 #include <iostream>
 #include <string>
 
 // ---------------------------------------------------------------- Pins
-constexpr unsigned PIN_IN1 = 2;
-constexpr unsigned PIN_IN2 = 3;
-constexpr unsigned PIN_IN3 = 15;
-constexpr unsigned PIN_IN4 = 14;
-constexpr unsigned PIN_SERVO = 12;
+constexpr int PIN_IN1 = 2;
+constexpr int PIN_IN2 = 3;
+constexpr int PIN_IN3 = 15;
+constexpr int PIN_IN4 = 14;
+constexpr int PIN_SERVO = 12;
 
 // ---------------------------------------------------------------- Servo limits
 // Typical hobby servo: 500 us = 0 deg, 2500 us = 180 deg.
 // If your servo buzzes or hits its end stops, narrow these (e.g. 1000 / 2000).
 constexpr int SERVO_MIN_US = 500;
 constexpr int SERVO_MAX_US = 2500;
+constexpr int SERVO_HZ = 50;
 
 static std::atomic<bool> g_running{true};
+static int g_h = -1;          // lgpio chip handle
+static int g_servoUs = 0;     // last commanded pulse width (0 = off)
+static int g_pinState[4] = {0, 0, 0, 0};  // IN1..IN4 as we last set them
 
 // ---------------------------------------------------------------- Motor helpers
 enum class Dir { Stop, Forward, Reverse, Brake };
 
-static void setMotor(unsigned inA, unsigned inB, Dir d) {
-    switch (d) {
-        case Dir::Forward: gpioWrite(inA, 1); gpioWrite(inB, 0); break;
-        case Dir::Reverse: gpioWrite(inA, 0); gpioWrite(inB, 1); break;
-        case Dir::Brake:   gpioWrite(inA, 1); gpioWrite(inB, 1); break;
-        case Dir::Stop:
-        default:           gpioWrite(inA, 0); gpioWrite(inB, 0); break;
-    }
+static void writePin(int idx, int pin, int level) {
+    lgGpioWrite(g_h, pin, level);
+    g_pinState[idx] = level;
 }
 
-static void motorA(Dir d) { setMotor(PIN_IN1, PIN_IN2, d); }
-static void motorB(Dir d) { setMotor(PIN_IN3, PIN_IN4, d); }
+static void setMotor(int idxA, int pinA, int pinB, Dir d) {
+    int a = 0, b = 0;
+    switch (d) {
+        case Dir::Forward: a = 1; b = 0; break;
+        case Dir::Reverse: a = 0; b = 1; break;
+        case Dir::Brake:   a = 1; b = 1; break;
+        case Dir::Stop:
+        default:           a = 0; b = 0; break;
+    }
+    writePin(idxA, pinA, a);
+    writePin(idxA + 1, pinB, b);
+}
+
+static void motorA(Dir d) { setMotor(0, PIN_IN1, PIN_IN2, d); }
+static void motorB(Dir d) { setMotor(2, PIN_IN3, PIN_IN4, d); }
 
 static void allMotorsStop() {
     motorA(Dir::Stop);
@@ -68,23 +82,24 @@ static int angleToPulse(int angle) {
     return SERVO_MIN_US + (angle * (SERVO_MAX_US - SERVO_MIN_US)) / 180;
 }
 
-static void servoAngle(int angle) {
-    gpioServo(PIN_SERVO, angleToPulse(angle));
+static void servoPulse(int us) {
+    // servoCycles = 0 means "run until changed".
+    lgTxServo(g_h, PIN_SERVO, us, SERVO_HZ, 0, 0);
+    g_servoUs = us;
 }
 
-static void servoOff() {
-    gpioServo(PIN_SERVO, 0);  // 0 stops the pulses
-}
+static void servoAngle(int angle) { servoPulse(angleToPulse(angle)); }
+static void servoOff()            { servoPulse(0); }
 
 static void servoSweep() {
     std::cout << "Sweeping 0 -> 180 -> 0 ...\n";
     for (int a = 0; a <= 180 && g_running; a += 2) {
         servoAngle(a);
-        gpioDelay(20000);  // 20 ms
+        lguSleep(0.02);
     }
     for (int a = 180; a >= 0 && g_running; a -= 2) {
         servoAngle(a);
-        gpioDelay(20000);
+        lguSleep(0.02);
     }
     std::cout << "Sweep done (servo still holding at 0).\n";
 }
@@ -110,43 +125,57 @@ static void printMenu() {
         "   c) Center (90 deg)\n"
         "   s) Set angle (0-180)\n"
         "   o) Servo off (stop pulses)\n"
-        "\n   p) Print current pin config\n"
+        "\n   p) Print current pin states\n"
         "   q) Quit\n"
         "===========================================\n"
         "> ";
 }
 
 static void printPins() {
-    std::cout << "\nPin states:\n"
-              << "  IN1 (GPIO " << PIN_IN1 << ") = " << gpioRead(PIN_IN1) << "\n"
-              << "  IN2 (GPIO " << PIN_IN2 << ") = " << gpioRead(PIN_IN2) << "\n"
-              << "  IN3 (GPIO " << PIN_IN3 << ") = " << gpioRead(PIN_IN3) << "\n"
-              << "  IN4 (GPIO " << PIN_IN4 << ") = " << gpioRead(PIN_IN4) << "\n"
-              << "  Servo pulse width = " << gpioGetServoPulsewidth(PIN_SERVO)
-              << " us (0 = off)\n";
+    std::cout << "\nPin states (as last commanded):\n"
+              << "  IN1 (GPIO " << PIN_IN1 << ") = " << g_pinState[0] << "\n"
+              << "  IN2 (GPIO " << PIN_IN2 << ") = " << g_pinState[1] << "\n"
+              << "  IN3 (GPIO " << PIN_IN3 << ") = " << g_pinState[2] << "\n"
+              << "  IN4 (GPIO " << PIN_IN4 << ") = " << g_pinState[3] << "\n"
+              << "  Servo pulse width = " << g_servoUs << " us (0 = off)\n";
 }
 
 static void onSignal(int) { g_running = false; }
 
+// Pi 5 exposes the header on gpiochip4; older Pis use gpiochip0.
+static int openChip() {
+    int h = lgGpiochipOpen(4);
+    if (h >= 0) return h;
+    return lgGpiochipOpen(0);
+}
+
 int main() {
-    if (gpioInitialise() < 0) {
-        std::cerr << "pigpio init failed. Are you running with sudo?\n"
-                     "(Also: pigpio does not support the Raspberry Pi 5.)\n";
+    g_h = openChip();
+    if (g_h < 0) {
+        std::cerr << "Could not open GPIO chip (error " << g_h << ").\n"
+                     "Try running with sudo, and make sure liblgpio is installed.\n";
         return 1;
     }
 
-    // Use our own handlers so we can clean up on Ctrl+C.
-    gpioSetSignalFunc(SIGINT, nullptr);
-    gpioSetSignalFunc(SIGTERM, nullptr);
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    for (unsigned pin : {PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4}) {
-        gpioSetMode(pin, PI_OUTPUT);
-        gpioWrite(pin, 0);
+    const int motorPins[4] = {PIN_IN1, PIN_IN2, PIN_IN3, PIN_IN4};
+    for (int pin : motorPins) {
+        int rc = lgGpioClaimOutput(g_h, 0, pin, 0);
+        if (rc < 0) {
+            std::cerr << "Failed to claim GPIO " << pin << " (error " << rc << ").\n"
+                         "GPIO 2/3 are I2C pins: make sure I2C is disabled in raspi-config.\n";
+            lgGpiochipClose(g_h);
+            return 1;
+        }
     }
-    gpioSetMode(PIN_SERVO, PI_OUTPUT);
-    servoOff();
+    int rc = lgGpioClaimOutput(g_h, 0, PIN_SERVO, 0);
+    if (rc < 0) {
+        std::cerr << "Failed to claim servo GPIO " << PIN_SERVO << " (error " << rc << ").\n";
+        lgGpiochipClose(g_h);
+        return 1;
+    }
 
     std::cout << "L298N + servo test. Motors start STOPPED, servo starts OFF.\n";
 
@@ -156,7 +185,7 @@ int main() {
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
 
-        switch (std::tolower(line[0])) {
+        switch (std::tolower(static_cast<unsigned char>(line[0]))) {
             case '1': motorA(Dir::Forward); std::cout << "Motor A forward\n"; break;
             case '2': motorA(Dir::Reverse); std::cout << "Motor A reverse\n"; break;
             case '3': motorA(Dir::Stop);    std::cout << "Motor A stopped\n"; break;
@@ -194,6 +223,8 @@ int main() {
     std::cout << "\nCleaning up...\n";
     allMotorsStop();
     servoOff();
-    gpioTerminate();
+    for (int pin : motorPins) lgGpioFree(g_h, pin);
+    lgGpioFree(g_h, PIN_SERVO);
+    lgGpiochipClose(g_h);
     return 0;
 }
